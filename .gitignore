@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+php2copia.py
+*.json
+*.csv
+.DS_Store
