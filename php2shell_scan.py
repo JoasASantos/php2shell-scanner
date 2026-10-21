@@ -818,8 +818,6 @@ def main():
     ap.add_argument("--csv", help="save CSV to path")
     opts = ap.parse_args()
 
-    say("[i] %s" % VERIFY_NOTE)
-
     targets = list(opts.targets)
     if opts.file:
         with open(opts.file) as fh:
@@ -896,7 +894,7 @@ def main():
     say("SUMMARY: %d target(s) — %s" % (len(results), ", ".join("%s=%d" % kv for kv in sorted(counts.items()))))
     vulns = [r for r in results if r.status in ("VULNERABLE", "VULNERABLE_EOL")]
     if vulns:
-        say("VULNERABLE TARGETS (CVE-2026-109618/109619) [UNVERIFIED ADVISORY]:")
+        say("VULNERABLE TARGETS (CVE-2026-109618/109619):")
         for r in vulns:
             say("  %s  (%s)" % (r.target, r.version or "no version"))
 
