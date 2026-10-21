@@ -72,6 +72,8 @@ python3 php2shell_scan.py https://example.com --probe --probe-count 5
 | `--recon-only` | Enumerate subdomains only, no scanning |
 | `--banner` | Force robust raw-socket banner grab on every target |
 | `--phpinfo-paths` | Probe common exposed `phpinfo()` paths |
+| `--deep-version` | Extra version techniques: PHP easter eggs + version-leak files (`composer.json`, `.env`, …) |
+| `--origin-scan` | Reach the PHP origin behind Cloudflare/WAF — direct-to-IP request with the real Host header |
 | `--probe` | Multipart load probe — **DoS risk**, authorized only |
 | `--probe-count N` | Number of probe requests (default 5) |
 | `--threads N` / `--timeout N` | Concurrency / per-request timeout |
@@ -97,6 +99,34 @@ exploit attempt:
 - **Deep phpinfo parse** (when exposed) — Server API, build date,
   `memory_limit` / `post_max_size` / `max_input_vars` (OOM surface for
   **CVE-2026-109618**), and `disable_functions` (mitigation).
+
+### Extra version techniques (`--deep-version`)
+
+When the version is not in a banner, the scanner also tries:
+
+- **PHP easter eggs** — the classic `?=PHPE9568F34-...` query strings. On
+  `expose_php=On` they return a characteristic GIF / credits page, confirming
+  PHP (and sometimes a version) even when headers are stripped.
+- **Version-leak files** — `composer.json` / `composer.lock` /
+  `vendor/composer/installed.json` / `.env`. A `"php": ">=8.2"` constraint
+  *narrows the branch* (declared requirement, not the live patch level); a
+  `PHP_VERSION=8.3.1` in `.env` is treated as an exact version.
+
+### Origin / WAF bypass (`--origin-scan`)
+
+Cloudflare and similar WAFs hide the PHP origin, so a header read only reflects
+the edge. With `--origin-scan` the scanner, using passive DNS only:
+
+1. resolves the apex, `www`, and common non-proxied prefixes
+   (`origin.*`, `cpanel.*`, `mail.*`, `dev.*`, …) plus any recon subdomains;
+2. drops every IP inside the published **Cloudflare / Imperva / Sucuri** edge
+   ranges (IPv4 **and** IPv6);
+3. connects to each remaining **origin IP directly** with the real `Host`
+   header and SNI, then banner-grabs — reading `Server` / `X-Powered-By` /
+   error pages straight from the origin, bypassing the CDN.
+
+No exploitation, no edge-evasion payloads — just a direct request to an IP the
+DNS surface already exposed. Authorized targets only.
 
 Each verdict carries a **confidence** grade:
 

@@ -33,6 +33,7 @@ Usage:
   python3 php2shell_scan.py https://example.com --phpinfo-paths
   python3 php2shell_scan.py example.com --recon --threads 10 -o out.json
   python3 php2shell_scan.py -f targets.txt --banner
+  python3 php2shell_scan.py example.com --deep-version --origin-scan
   python3 php2shell_scan.py https://example.com --probe --probe-count 5
 
 Authorization: run only against assets you own or are explicitly
@@ -41,6 +42,7 @@ permitted to test.
 
 import argparse
 import concurrent.futures
+import ipaddress
 import json
 import re
 import shutil
@@ -822,6 +824,266 @@ def scan_local(php_bin="php"):
 
 
 # ---------------------------------------------------------------------------
+# Extra PHP version-fingerprinting techniques (passive / non-exploit)
+# ---------------------------------------------------------------------------
+# Classic PHP "easter egg" query strings. On expose_php=On they return a
+# characteristic GIF (or the credits page), confirming PHP and its era.
+PHP_EGGS = {
+    "logo":    "PHPE9568F34-D428-11d2-A769-00AA001ACF42",   # PHP logo
+    "zend":    "PHPE9568F35-D428-11d2-A769-00AA001ACF42",   # Zend logo
+    "credits": "PHPB8B5F2A0-3C92-11d3-A3A9-4C7B08C10000",   # credits page
+    "egg":     "PHPE9568F36-D428-11d2-A769-00AA001ACF42",   # easter egg logo
+}
+# Files that may DECLARE a PHP version constraint (not the live runtime).
+VERSION_LEAK_FILES = [
+    "/composer.json", "/composer.lock", "/vendor/composer/installed.json",
+    "/.env", "/phpunit.xml", "/phpunit.xml.dist",
+]
+
+
+def probe_php_eggs(opener, base, hostpath="/"):
+    """
+    Request the PHP easter-egg query strings. Returns (confirmed, era) where
+    confirmed means PHP presence was proven, and era is a coarse version hint.
+    Non-destructive GETs. Works only when expose_php=On.
+    """
+    target = base.rstrip("/") + (hostpath if hostpath.startswith("/") else "/" + hostpath)
+    for name, egg in PHP_EGGS.items():
+        url = "%s?=%s" % (target, egg)
+        res = http_get(opener, url, max_bytes=40_000)
+        if res.get("status") != 200:
+            continue
+        hdrs = {k.lower(): v for k, v in res.get("headers", {}).items()}
+        ctype = hdrs.get("content-type", "")
+        body = res.get("body", "")
+        # GIF response to a logo egg = PHP with expose_php On
+        if "image/gif" in ctype or body[:6] in ("GIF87a", "GIF89a"):
+            return True, "egg:%s (expose_php=On)" % name
+        # credits page leaks build/version strings
+        if name == "credits" and ("PHP Credits" in body or "PHP Group" in body):
+            m = re.search(r"PHP\s*(\d+\.\d+\.\d+)", body)
+            return True, ("egg:credits %s" % m.group(1)) if m else "egg:credits"
+    return False, None
+
+
+def probe_version_files(opener, base):
+    """
+    Fetch files that may declare a required PHP version. Returns (constraint,
+    source) — a DECLARED requirement (e.g. '>=8.1'), not the live runtime, so
+    it only narrows the branch, never confirms the patch level.
+    """
+    for p in VERSION_LEAK_FILES:
+        url = urllib.parse.urljoin(base + "/", p.lstrip("/"))
+        res = http_get(opener, url, max_bytes=60_000)
+        if res.get("status") != 200 or not res.get("body"):
+            continue
+        body = res["body"]
+        # composer: "php": ">=8.1" or "require": {"php": "^8.2"}
+        m = re.search(r'"php"\s*:\s*"([^"]+)"', body)
+        if m:
+            return m.group(1), "file:%s" % p
+        # .env sometimes carries PHP_VERSION=8.3.1
+        m = re.search(r'PHP_VERSION\s*=\s*["\']?(\d+\.\d+\.\d+)', body)
+        if m:
+            return m.group(1), "file:%s" % p
+    return None, None
+
+
+# ---------------------------------------------------------------------------
+# Origin discovery — reach the PHP origin behind Cloudflare / other WAFs
+# ---------------------------------------------------------------------------
+# Published Cloudflare IPv4 ranges (https://www.cloudflare.com/ips/).
+CLOUDFLARE_CIDRS = [ipaddress.ip_network(c) for c in (
+    "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+    "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
+    "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+    "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+    # Cloudflare IPv6 ranges
+    "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32", "2405:b500::/32",
+    "2405:8100::/32", "2a06:98c0::/29", "2c0f:f248::/32",
+)]
+# A few other common edge providers whose IPs are NOT the origin either.
+OTHER_EDGE_CIDRS = [ipaddress.ip_network(c) for c in (
+    "199.83.128.0/21", "198.143.32.0/19",            # Imperva/Incapsula
+    "192.230.64.0/18",                               # Sucuri
+)]
+# Subdomain prefixes that commonly point straight at the origin (not proxied).
+ORIGIN_HINT_PREFIXES = [
+    "origin", "direct", "direct-connect", "cpanel", "whm", "webmail", "mail",
+    "ftp", "sftp", "ssh", "server", "web", "dev", "staging", "stage", "test",
+    "vpn", "remote", "portal", "admin", "api", "autodiscover", "ns1", "ns2",
+    "mx", "smtp", "backup", "old", "beta",
+]
+
+
+def _is_edge_ip(ip):
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr in n for n in CLOUDFLARE_CIDRS) or any(addr in n for n in OTHER_EDGE_CIDRS)
+
+
+def _a_records(host):
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except Exception:
+        return []
+    out = []
+    for fam, _, _, _, sa in infos:
+        ip = sa[0]
+        if ip not in out:
+            out.append(ip)
+    return out
+
+
+def discover_origin_ips(domain, extra_hosts=None, insecure=False, max_candidates=12):
+    """
+    Find candidate origin IPs that are NOT behind Cloudflare/WAF edge ranges.
+    Strategy (passive DNS only):
+      1. resolve the apex and www,
+      2. resolve common non-proxied prefixes (origin.*, cpanel.*, mail.*, ...),
+      3. resolve any extra hosts handed in (e.g. crt.sh/subfinder output),
+      4. keep only IPs outside known edge CIDRs.
+    Returns (origin_ips, notes).
+    """
+    domain = _normalize_domain(domain)
+    notes = []
+    candidate_hosts = {domain, "www." + domain}
+    candidate_hosts.update("%s.%s" % (p, domain) for p in ORIGIN_HINT_PREFIXES)
+    if extra_hosts:
+        candidate_hosts.update(h for h in extra_hosts if h.endswith(domain))
+
+    edge_ips, origin_ips = set(), {}
+    for h in sorted(candidate_hosts):
+        for ip in _a_records(h):
+            if _is_edge_ip(ip):
+                edge_ips.add(ip)
+            else:
+                origin_ips.setdefault(ip, h)   # ip -> first host that revealed it
+    if edge_ips and not origin_ips:
+        notes.append("all resolved IPs are behind the edge (%d) — no direct origin found via DNS" % len(edge_ips))
+    ranked = list(origin_ips.items())[:max_candidates]
+    return ranked, notes
+
+
+def _raw_http_to_ip(ip, host, port, use_tls, request_line, insecure, timeout=8, read_bytes=65536):
+    """
+    Same as _raw_http but connects to a specific IP while presenting the real
+    Host header and TLS SNI — this is how we reach the origin behind a CDN.
+    """
+    sock = None
+    try:
+        sock = socket.create_connection((ip, port), timeout=timeout)
+        if use_tls:
+            ctx = ssl.create_default_context()
+            # origin cert often will not match when hit by IP; be lenient here
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            sock = ctx.wrap_socket(sock, server_hostname=host)
+        hdr = ["%s HTTP/1.1" % request_line,
+               "Host: %s" % host,
+               "User-Agent: %s" % UA,
+               "Accept: */*",
+               "Connection: close"]
+        sock.sendall(("\r\n".join(hdr) + "\r\n\r\n").encode())
+        chunks, got = [], 0
+        while got < read_bytes:
+            data = sock.recv(8192)
+            if not data:
+                break
+            chunks.append(data)
+            got += len(data)
+        raw = b"".join(chunks)
+    except Exception as e:
+        return None, {}, "", str(e)
+    finally:
+        try:
+            if sock:
+                sock.close()
+        except Exception:
+            pass
+    text = raw.decode("iso-8859-1", "replace")
+    head, _, body = text.partition("\r\n\r\n")
+    lines = head.split("\r\n")
+    status_line = lines[0] if lines else ""
+    hdrs = {}
+    for line in lines[1:]:
+        if ":" in line:
+            k, _, v = line.partition(":")
+            hdrs[k.strip().lower()] = v.strip()
+    return status_line, hdrs, body, None
+
+
+def origin_banner(host, origin_ip, insecure=False, timeout=8):
+    """
+    Hit a candidate origin IP directly (bypassing the CDN) with the real Host
+    header, over https then http. Returns a dict with any PHP version/signals
+    found straight from the origin.
+    """
+    out = {"origin_ip": origin_ip, "version": None, "version_source": None,
+           "server": None, "x_powered_by": None, "reachable": False, "php_signals": []}
+    for scheme, port, tls in (("https", 443, True), ("http", 80, False)):
+        status, hdrs, body, err = _raw_http_to_ip(origin_ip, host, port, tls, "GET /", insecure, timeout=timeout)
+        if err:
+            continue
+        out["reachable"] = True
+        srv = hdrs.get("server")
+        xpb = hdrs.get("x-powered-by")
+        if srv and not out["server"]:
+            out["server"] = srv
+        if xpb and not out["x_powered_by"]:
+            out["x_powered_by"] = xpb
+        # a CF-origin that is itself Cloudflare means we did not escape it
+        if srv and "cloudflare" in srv.lower():
+            continue
+        for blob in (xpb or "", srv or ""):
+            for pat in VER_PATTERNS:
+                m = pat.search(blob)
+                if m:
+                    out["version"] = m.group(1)
+                    out["version_source"] = "origin:%s:%s" % (origin_ip, scheme)
+        if hdrs.get("set-cookie") and "PHPSESSID" in hdrs["set-cookie"]:
+            out["php_signals"].append("cookie:PHPSESSID")
+        if body:
+            for pat in PHP_ERROR_MARKERS:
+                if pat.search(body):
+                    out["php_signals"].append("error-disclosure")
+                    if not out["version"]:
+                        vm = re.search(r"PHP/?(\d+\.\d+\.\d+)", body)
+                        if vm:
+                            out["version"] = vm.group(1)
+                            out["version_source"] = "origin:%s:errorpage" % origin_ip
+                    break
+        if out["version"]:
+            break
+    return out
+
+
+def try_origin_bypass(domain, host, extra_hosts, insecure, timeout):
+    """
+    Full origin-bypass flow: discover non-edge IPs, then banner-grab each
+    directly. Returns (best_result|None, all_attempts, notes).
+    """
+    ips, notes = discover_origin_ips(domain, extra_hosts=extra_hosts, insecure=insecure)
+    attempts = []
+    best = None
+    for ip, via in ips:
+        ob = origin_banner(host, ip, insecure=insecure, timeout=timeout)
+        ob["via_host"] = via
+        attempts.append(ob)
+        if ob.get("version") and not best:
+            best = ob
+        elif ob.get("reachable") and (ob.get("x_powered_by") or ob.get("php_signals")) and not best:
+            best = ob
+    if ips and not attempts:
+        notes.append("origin candidates found but none answered a direct request")
+    elif not ips and not notes:
+        notes.append("no non-edge origin IP discovered via passive DNS")
+    return best, attempts, notes
+
+
+# ---------------------------------------------------------------------------
 # Scan one remote target
 # ---------------------------------------------------------------------------
 @dataclass
@@ -843,6 +1105,9 @@ class TargetResult:
     proxy: str = None             # CDN/WAF/proxy in front (banner may be masked)
     distro_build: str = None      # distro package marker (backport may have fixed)
     phpinfo: dict = field(default_factory=dict)  # deep-parsed phpinfo fields
+    php_era: str = None           # coarse version hint from easter eggs
+    declared_php: str = None      # declared PHP constraint from a leaked file
+    origin: dict = None           # origin-bypass result (direct-to-IP banner)
     confidence: str = None        # HIGH / MEDIUM / LOW for the verdict
     notes: list = field(default_factory=list)    # human-readable caveats
     error: str = None
@@ -919,6 +1184,37 @@ def scan_target(target, opts):
                 if dm:
                     r.distro_build = dm.group(1).lower()
 
+    # 4b) extra version techniques when still no exact version
+    if not r.version or opts.deep_version:
+        confirmed, era = probe_php_eggs(opener, base)
+        if confirmed:
+            r.php_detected = True
+            r.php_era = era
+            if era and era.startswith("egg:credits ") and not r.version:
+                r.version, r.version_source = era.split()[-1], "egg:credits"
+        dver, dsrc = probe_version_files(opener, base)
+        if dver:
+            r.php_detected = True
+            # exact X.Y.Z from a file is usable; a constraint only narrows branch
+            if re.fullmatch(r"\d+\.\d+\.\d+", dver) and not r.version:
+                r.version, r.version_source = dver, dsrc
+            else:
+                r.declared_php = "%s (%s)" % (dver, dsrc)
+
+    # 4c) origin-bypass: if behind an edge/WAF and still no version, go direct
+    if opts.origin_scan and not r.version and (r.proxy or not r.version):
+        extra = getattr(opts, "_recon_hosts", None)
+        best, attempts, onotes = try_origin_bypass(
+            host.split(".", 1)[-1] if host and host.count(".") >= 2 else host,
+            host, extra, opts.insecure, opts.timeout)
+        r.origin = {"best": best, "attempts": attempts, "notes": onotes}
+        if best and best.get("version"):
+            r.php_detected, r.version, r.version_source = True, best["version"], best["version_source"]
+            r.notes.append("origin reached directly at %s — CDN/WAF bypassed" % best["origin_ip"])
+        elif best and best.get("x_powered_by"):
+            r.php_detected = True
+            r.notes.append("origin %s leaked X-Powered-By: %s (CDN bypassed, no exact version)" % (best["origin_ip"], best["x_powered_by"]))
+
     # 5) classification
     if r.php_detected:
         c = classify(r.version)
@@ -931,6 +1227,10 @@ def scan_target(target, opts):
 
     # 6) grade confidence + attach caveats (pure reasoning, no new requests)
     assess_confidence(r)
+    if r.php_era and "expose_php=On" in (r.php_era or ""):
+        r.notes.append("PHP confirmed via easter egg (%s)" % r.php_era)
+    if r.declared_php:
+        r.notes.append("declared PHP requirement %s — narrows branch, not the patch level" % r.declared_php)
 
     # 7) opt-in probe
     if opts.probe and r.php_detected:
@@ -978,6 +1278,16 @@ def fmt_result(r):
         lines.append("  Proxy/WAF     : %s" % r.proxy)
     if r.distro_build:
         lines.append("  Build         : distro-packaged (%s) — backport possible" % r.distro_build)
+    if r.php_era:
+        lines.append("  Easter egg    : %s" % r.php_era)
+    if r.declared_php:
+        lines.append("  Declared PHP  : %s" % r.declared_php)
+    if r.origin and r.origin.get("best"):
+        ob = r.origin["best"]
+        lines.append("  ORIGIN BYPASS : %s (via %s) Server=%s X-Powered-By=%s" % (
+            ob.get("origin_ip"), ob.get("via_host"), ob.get("server"), ob.get("x_powered_by")))
+    elif r.origin and r.origin.get("notes"):
+        lines.append("  Origin bypass : %s" % "; ".join(r.origin["notes"]))
     if r.phpinfo:
         pi = r.phpinfo
         kv = [("%s=%s" % (k, pi[k])) for k in ("build_date", "memory_limit", "post_max_size", "max_input_vars") if pi.get(k)]
@@ -1013,6 +1323,8 @@ def main():
     ap.add_argument("--recon-only", action="store_true", help="only enumerate subdomains (crt.sh), do not scan")
     ap.add_argument("--banner", action="store_true", help="force robust raw-socket banner grab on every target")
     ap.add_argument("--phpinfo-paths", action="store_true", help="look for exposed phpinfo() (more requests)")
+    ap.add_argument("--deep-version", action="store_true", help="extra version techniques: PHP easter eggs + version-leak files (composer.json, .env, ...)")
+    ap.add_argument("--origin-scan", action="store_true", help="try to reach the PHP origin behind Cloudflare/WAF (direct-to-IP request with real Host header)")
     ap.add_argument("--probe", action="store_true", help="WARNING: multipart load probe (may cause DoS; authorized use only)")
     ap.add_argument("--probe-count", type=int, default=5, help="number of probe requests (default 5)")
     ap.add_argument("--threads", type=int, default=5)
@@ -1073,6 +1385,11 @@ def main():
             say("[recon] %d host(s) total" % len(seen))
             return 0
         targets += expanded
+        # share all discovered hosts with origin discovery (more A-records to test)
+        opts._recon_hosts = sorted(seen)
+
+    if opts.origin_scan:
+        say("[i] ORIGIN-SCAN active: probing non-edge IPs directly with the real Host header to bypass CDN/WAF. Authorized targets only.")
 
     if opts.probe:
         say("[!] PROBE active: sending multipart load. DoS risk on fragile workers. Confirm you are authorized.")
