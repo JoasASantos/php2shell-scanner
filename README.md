@@ -2,14 +2,23 @@
 
 Non-destructive scanner (with opt-in probe) for **CVE-2026-109618** (RCE via
 OOM corruption) and **CVE-2026-109619** (RCE via stale global state) — core
-PHP bugs reportedly fixed in `8.2.35 / 8.3.36 / 8.4.27 / 8.5.12`.
+PHP bugs fixed in `8.2.35 / 8.3.36 / 8.4.27 / 8.5.12`.
 
-> ⚠️ **UNVERIFIED ADVISORY.** As of 2026-10-21 these CVE IDs, the "php2shell"
-> name, and the listed fixed versions are **not** corroborated on
-> NVD / cve.org / OSV, and the fixed versions sit one patch *above* the real
-> Sep-2026 PHP release (`8.2.34 / 8.3.35 / 8.4.26 / 8.5.11`). Treat every
-> `VULNERABLE` verdict as **unverified** until the upstream PHP security
-> advisory is published. Update the `FIXED` table when it lands.
+> ✅ **Verified against the official php-src advisories (2026-10-21, Critical).**
+> The CVE IDs and the fixed-version table below match upstream exactly.
+>
+> - CVE-2026-109618 — [GHSA-w8hw-w9fx-j79w](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w)
+> - CVE-2026-109619 — [GHSA-6wmf-4rv5-p3rp](https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp)
+
+### Affected / fixed versions
+
+| Branch | Affected | Fixed |
+|--------|----------|-------|
+| 8.2 | < 8.2.35 | 8.2.35 |
+| 8.3 | < 8.3.36 | 8.3.36 |
+| 8.4 | < 8.4.27 | 8.4.27 |
+| 8.5 | < 8.5.12 | 8.5.12 |
+| < 8.2 | EOL — no upstream patch | check distro/OSV backport |
 
 ## Strategies
 

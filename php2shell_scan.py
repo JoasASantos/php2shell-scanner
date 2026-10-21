@@ -7,12 +7,12 @@ request memory at shutdown) and CVE-2026-109619 (RCE via stale global
 state — global state from a previous request reused by a persistent
 worker). Core PHP bugs, fixed in 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12.
 
-  !!! ADVISORY NOT INDEPENDENTLY CONFIRMED !!!
-  As of 2026-10-21 these CVE IDs, the "php2shell" name, and the listed
-  fixed versions do NOT appear on NVD / cve.org / OSV, and the fixed
-  versions sit one patch ABOVE the real Sep-2026 PHP release
-  (8.2.34 / 8.3.35 / 8.4.26 / 8.5.11). Treat every VULNERABLE verdict as
-  UNVERIFIED until the upstream advisory is published. See VERIFY_NOTE.
+Official advisories (published 2026-10-21, Critical, by bukka):
+  CVE-2026-109618 — GHSA-w8hw-w9fx-j79w
+    https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w
+  CVE-2026-109619 — GHSA-6wmf-4rv5-p3rp
+    https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp
+Fixed-version table below matches the advisories exactly (verified 2026-10-21).
 
 Strategies:
   1. LOCAL    : php -v / php -i (max precision — exact runtime version).
@@ -63,13 +63,13 @@ CVES = {
     "CVE-2026-109619": "RCE via stale global state (prior-request global state reused by a persistent worker)",
 }
 
-VERIFY_NOTE = (
-    "UNVERIFIED ADVISORY: CVE IDs and fixed versions below are not yet "
-    "corroborated on NVD/cve.org/OSV (checked 2026-10-21). Confirm against "
-    "the upstream PHP security advisory before acting on any verdict."
-)
+# Official advisory references (verified against php-src 2026-10-21)
+ADVISORIES = {
+    "CVE-2026-109618": "GHSA-w8hw-w9fx-j79w",
+    "CVE-2026-109619": "GHSA-6wmf-4rv5-p3rp",
+}
 
-# Minimum FIXED version per branch
+# Minimum FIXED version per branch (matches both advisories exactly)
 FIXED = {
     (8, 2): (8, 2, 35),
     (8, 3): (8, 3, 36),
@@ -786,7 +786,8 @@ def fmt_result(r):
         lines.append("  Detail        : %s" % r.detail)
     for cve, desc in CVES.items():
         v = (r.cves or {}).get(cve, "-")
-        lines.append("    %s [%s] -> %s" % (cve, desc.split("(")[0].strip(), v))
+        ghsa = ADVISORIES.get(cve, "")
+        lines.append("    %s (%s) [%s] -> %s" % (cve, ghsa, desc.split("(")[0].strip(), v))
     if r.banner and r.banner.get("probes"):
         srv = next((p.get("server") for p in r.banner["probes"] if p.get("server")), None)
         xpb = next((p.get("x_powered_by") for p in r.banner["probes"] if p.get("x_powered_by")), None)
