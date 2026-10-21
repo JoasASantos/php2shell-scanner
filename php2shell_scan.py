@@ -675,6 +675,40 @@ def _normalize_domain(domain):
     return domain.split("/")[0].split(":")[0]
 
 
+# Common multi-label public suffixes. Not a full PSL, but covers the cases
+# that break a naive "strip one label" (e.g. example.com.br -> com.br).
+MULTI_LABEL_SUFFIXES = frozenset((
+    "com.br", "net.br", "org.br", "gov.br", "edu.br",
+    "co.uk", "org.uk", "gov.uk", "ac.uk", "me.uk",
+    "com.au", "net.au", "org.au", "gov.au", "edu.au",
+    "co.jp", "or.jp", "ne.jp", "go.jp",
+    "com.mx", "com.ar", "com.co", "com.tr", "com.cn",
+    "co.in", "co.za", "co.nz", "co.kr", "com.sg", "com.hk",
+    "com.pt", "com.es", "com.pl", "com.ua", "com.ru",
+))
+
+
+def registrable_domain(host):
+    """
+    Reduce a hostname to the registrable (apex) domain, honoring common
+    two-label public suffixes. 'www.example.com.br' -> 'example.com.br',
+    'origin.example.com' -> 'example.com'. Returns host unchanged when it is
+    already at (or below) the apex. Used only to seed sibling-subdomain origin
+    discovery for an OWNED domain — never to reach across to unrelated hosts.
+    """
+    host = _normalize_domain(host)
+    if not host:
+        return host
+    labels = host.split(".")
+    if len(labels) <= 2:
+        return host
+    last_two = ".".join(labels[-2:])
+    if last_two in MULTI_LABEL_SUFFIXES:
+        # keep three labels: <name>.<second-level>.<tld>
+        return ".".join(labels[-3:])
+    return last_two
+
+
 def subfinder_subdomains(domain, timeout=120):
     """
     Fallback enumeration via ProjectDiscovery subfinder (passive).
@@ -1335,7 +1369,7 @@ def scan_target(target, opts):
     if opts.origin_scan and not r.version and (r.proxy or not r.version):
         extra = getattr(opts, "_recon_hosts", None)
         best, attempts, onotes = try_origin_bypass(
-            host.split(".", 1)[-1] if host and host.count(".") >= 2 else host,
+            registrable_domain(host) if host else host,
             host, extra, opts.insecure, opts.timeout, opts=opts)
         r.origin = {"best": best, "attempts": attempts, "notes": onotes}
         if best and best.get("version"):
