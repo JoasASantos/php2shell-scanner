@@ -82,76 +82,52 @@ python3 php2shell_scan.py https://example.com --probe --probe-count 5
 | `--insecure` | Do not validate TLS |
 | `-o FILE` / `--csv FILE` | Save JSON / CSV report |
 
-## Passive enrichment (no exploitation)
+## Passive enrichment
 
-Beyond the version check, each target is enriched with passive signals that
-refine the verdict and cut false positives — all from normal responses, no
-exploit attempt:
+Beyond the version check, each target is enriched with passive signals (from
+normal responses) that refine the verdict and cut false positives:
 
-- **SAPI / worker model** — `fpm`, `mod_php`, `cgi`. Persistent workers reuse
-  request state, so they are the ones exposed to **CVE-2026-109619** (stale
-  global state); plain CGI is far less exposed.
-- **CDN / WAF / proxy** (Cloudflare, Akamai, CloudFront, Fastly, Sucuri, …) —
-  a banner may reflect the edge, not the PHP origin, so the version reading is
-  flagged lower-confidence.
-- **Distro-packaged build** (`ubuntu`, `+deb`, `.el8`, …) — distros backport
-  fixes **without** bumping the upstream number, so a version-only match may be
-  a false positive; verdict confidence is reduced with a "verify the changelog"
-  note.
-- **Deep phpinfo parse** (when exposed) — Server API, build date,
-  `memory_limit` / `post_max_size` / `max_input_vars` (OOM surface for
-  **CVE-2026-109618**), and `disable_functions` (mitigation).
+- **SAPI / worker model** — persistent workers (`fpm`, `mod_php`) reuse request
+  state → exposed to **CVE-2026-109619**; plain `cgi` far less.
+- **CDN / WAF / proxy** (Cloudflare, Akamai, Fastly, Sucuri…) — banner may be
+  the edge, not the origin → confidence lowered.
+- **Distro build** (`ubuntu`, `+deb`, `.el8`…) — backport may fix without a
+  version bump → confidence lowered, "verify the changelog" note.
+- **Deep phpinfo** (when exposed) — Server API, `post_max_size` /
+  `max_input_vars` (OOM surface for **CVE-2026-109618**), `disable_functions`.
 
-### Extra version techniques (`--deep-version`)
+### More version techniques (`--deep-version`)
 
-When the version is not in a banner, the scanner also tries:
-
-- **PHP easter eggs** — the classic `?=PHPE9568F34-...` query strings. On
-  `expose_php=On` they return a characteristic GIF / credits page, confirming
-  PHP (and sometimes a version) even when headers are stripped.
-- **Version-leak files** — `composer.json` / `composer.lock` /
-  `vendor/composer/installed.json` / `.env`. A `"php": ">=8.2"` constraint
-  *narrows the branch* (declared requirement, not the live patch level); a
-  `PHP_VERSION=8.3.1` in `.env` is treated as an exact version.
+When no banner version: **PHP easter eggs** (`?=PHPE9568F34-...` → GIF/credits
+on `expose_php=On`) and **version-leak files** (`composer.json`, `.env`, …;
+`.env` `PHP_VERSION` = exact, a `"php": ">=8.2"` constraint only narrows branch).
 
 ### Origin / WAF bypass (`--origin-scan`)
 
-Cloudflare and similar WAFs hide the PHP origin, so a header read only reflects
-the edge. With `--origin-scan` the scanner, using passive DNS only:
+CDNs hide the origin, so a header read only shows the edge. `--origin-scan`:
 
-1. resolves the apex, `www`, and common non-proxied prefixes
-   (`origin.*`, `cpanel.*`, `mail.*`, `dev.*`, …) plus any recon subdomains;
-2. drops every IP inside the published **Cloudflare / Imperva / Sucuri** edge
-   ranges (IPv4 **and** IPv6);
-3. connects to each remaining **origin IP directly** with the real `Host`
-   header and SNI, then banner-grabs — reading `Server` / `X-Powered-By` /
-   error pages straight from the origin, bypassing the CDN.
+1. resolves apex, `www`, non-proxied prefixes (`origin.*`, `cpanel.*`, `mail.*`…)
+   and recon subdomains;
+2. drops IPs in **Cloudflare / Imperva / Sucuri** edge ranges (IPv4 + IPv6);
+3. requests each remaining **origin IP directly** with the real `Host` + SNI,
+   reading `Server` / `X-Powered-By` / error pages straight from the origin.
 
-No exploitation, no edge-evasion payloads — just a direct request to an IP the
-DNS surface already exposed. Authorized targets only.
+A direct request to an already-exposed IP. Authorized targets only.
 
-#### Threat-intel origin discovery (Shodan / Censys)
+Credentialed intel adds IPs DNS never exposes, plus a PHP version from the
+indexed banner (flagged intel — may be stale):
 
-When DNS exposes no origin, **Shodan** and **Censys** can still reveal it — they
-index real origin banners captured before the CDN was placed (or from
-non-proxied ports). Provide credentials and the scanner will:
-
-- pull candidate IPs tied to the domain (by hostname / TLS-cert / DNS name),
-- drop any that fall in a CDN/WAF edge range (IPv4 + IPv6),
-- banner-grab the rest directly, **and** read any PHP version already present
-  in the Shodan/Censys banner (flagged as intel — may be stale, re-verify live).
+- `--shodan-key` / env `SHODAN_API_KEY` — hosts by `hostname:<domain>`.
+- `--censys-id` + `--censys-secret` / env `CENSYS_API_ID` + `CENSYS_API_SECRET`
+  — hosts by TLS-cert / DNS name.
+- Any credential auto-enables `--origin-scan`.
 
 ```bash
-export SHODAN_API_KEY=xxxxxxxx
-export CENSYS_API_ID=xxxx CENSYS_API_SECRET=xxxx
-python3 php2shell_scan.py hackersec.com --origin-scan      # keys auto-detected
-# or inline:
-python3 php2shell_scan.py hackersec.com --shodan-key xxxx --censys-id a --censys-secret b
+export SHODAN_API_KEY=xxx CENSYS_API_ID=xxx CENSYS_API_SECRET=xxx
+python3 php2shell_scan.py hackersec.com --origin-scan
 ```
 
-Supplying any credential turns on `--origin-scan` automatically.
-
-Each verdict carries a **confidence** grade:
+### Confidence grade
 
 | Confidence | Meaning |
 |-----------|---------|
