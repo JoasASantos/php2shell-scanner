@@ -41,9 +41,11 @@ permitted to test.
 """
 
 import argparse
+import base64
 import concurrent.futures
 import ipaddress
 import json
+import os
 import re
 import shutil
 import socket
@@ -383,9 +385,18 @@ def assess_confidence(r):
         elif "errorpage" in src:
             conf = "HIGH"
             notes.append("version from PHP error page (authoritative)")
+        elif src.startswith("origin:"):
+            conf = "HIGH"
+            notes.append("version read directly from the origin (CDN/WAF bypassed)")
         elif src.startswith(("header:", "banner:")):
             conf = "MEDIUM"
             notes.append("version from HTTP banner (expose_php=On)")
+        elif src.startswith(("shodan:", "censys:")):
+            conf = "MEDIUM"
+            notes.append("version from %s scan data (intel — may be stale, re-verify live)" % src.split(":")[0])
+        elif src.startswith("egg:"):
+            conf = "MEDIUM"
+            notes.append("version from PHP easter-egg credits page")
     else:
         notes.append("no version disclosed — verdict is inference-only")
 
@@ -1060,12 +1071,122 @@ def origin_banner(host, origin_ip, insecure=False, timeout=8):
     return out
 
 
-def try_origin_bypass(domain, host, extra_hosts, insecure, timeout):
+# ---------------------------------------------------------------------------
+# Threat-intel origin discovery — Shodan / Censys (optional, API key needed)
+# ---------------------------------------------------------------------------
+def _http_json(url, headers=None, timeout=20):
+    """GET a URL and parse JSON. Returns (data, error)."""
+    req = urllib.request.Request(url, headers=headers or {"User-Agent": UA})
+    try:
+        resp = urllib.request.urlopen(req, timeout=timeout)
+        return json.loads(resp.read().decode("utf-8", "replace")), None
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read(500).decode("utf-8", "replace")
+        except Exception:
+            pass
+        return None, "HTTP %s %s" % (e.code, detail[:200])
+    except Exception as e:
+        return None, str(e)
+
+
+def shodan_lookup(domain, key, timeout=20):
     """
-    Full origin-bypass flow: discover non-edge IPs, then banner-grab each
-    directly. Returns (best_result|None, all_attempts, notes).
+    Query Shodan for hosts tied to `domain`. Returns (ip_via, banners, notes):
+      ip_via  : {ip: "shodan:<reason>"} candidate origin IPs
+      banners : [(ip, php_version, "shodan:<ip>")] versions seen in banners
+    Shodan indexes real origin banners, so a PHP version may come back directly
+    even when the live host sits behind a CDN.
+    """
+    ip_via, banners, notes = {}, [], []
+    q = urllib.parse.quote('hostname:%s' % domain)
+    url = "https://api.shodan.io/shodan/host/search?key=%s&query=%s" % (urllib.parse.quote(key), q)
+    data, err = _http_json(url, timeout=timeout)
+    if err:
+        notes.append("shodan: %s" % err)
+        return ip_via, banners, notes
+    for m in data.get("matches", []):
+        ip = m.get("ip_str")
+        if not ip:
+            continue
+        ip_via.setdefault(ip, "shodan:hostname")
+        # pull a PHP version from anywhere in this match's banner data
+        blob = " ".join(str(m.get(k, "")) for k in ("data", "product", "version", "http"))
+        vm = re.search(r"PHP/?(\d+\.\d+\.\d+)", blob)
+        if vm:
+            banners.append((ip, vm.group(1), "shodan:%s" % ip))
+    if not ip_via:
+        notes.append("shodan: no hosts for hostname:%s" % domain)
+    return ip_via, banners, notes
+
+
+def censys_lookup(domain, api_id, api_secret, timeout=20):
+    """
+    Query the Censys Hosts Search API (v2) for hosts whose DNS names or TLS
+    certificate names match `domain`. Returns (ip_via, banners, notes).
+    """
+    ip_via, banners, notes = {}, [], []
+    q = ('dns.names: %s or services.tls.certificates.leaf_data.names: %s' % (domain, domain))
+    url = "https://search.censys.io/api/v2/hosts/search?q=%s&per_page=50" % urllib.parse.quote(q)
+    token = base64.b64encode(("%s:%s" % (api_id, api_secret)).encode()).decode()
+    data, err = _http_json(url, headers={"User-Agent": UA, "Authorization": "Basic %s" % token}, timeout=timeout)
+    if err:
+        notes.append("censys: %s" % err)
+        return ip_via, banners, notes
+    for h in (data.get("result", {}).get("hits", []) or []):
+        ip = h.get("ip")
+        if not ip:
+            continue
+        ip_via.setdefault(ip, "censys:cert/dns")
+        blob = json.dumps(h.get("services", []))
+        vm = re.search(r"PHP/?(\d+\.\d+\.\d+)", blob)
+        if vm:
+            banners.append((ip, vm.group(1), "censys:%s" % ip))
+    if not ip_via:
+        notes.append("censys: no hosts for %s" % domain)
+    return ip_via, banners, notes
+
+
+def intel_lookup(domain, opts, timeout=20):
+    """
+    Aggregate Shodan + Censys origin intel. Returns (ip_via, banners, notes).
+    Only runs the providers whose credentials are present.
+    """
+    ip_via, banners, notes = {}, [], []
+    if getattr(opts, "shodan_key", None):
+        iv, bn, nt = shodan_lookup(domain, opts.shodan_key, timeout)
+        ip_via.update(iv); banners += bn; notes += nt
+    if getattr(opts, "censys_id", None) and getattr(opts, "censys_secret", None):
+        iv, bn, nt = censys_lookup(domain, opts.censys_id, opts.censys_secret, timeout)
+        for k, v in iv.items():
+            ip_via.setdefault(k, v)
+        banners += bn; notes += nt
+    return ip_via, banners, notes
+
+
+def try_origin_bypass(domain, host, extra_hosts, insecure, timeout, opts=None):
+    """
+    Full origin-bypass flow: gather candidate origin IPs (passive DNS +
+    optional Shodan/Censys intel), then banner-grab each directly. Returns
+    (best_result|None, all_attempts, notes).
     """
     ips, notes = discover_origin_ips(domain, extra_hosts=extra_hosts, insecure=insecure)
+    seen = {ip for ip, _ in ips}
+
+    # fold in Shodan/Censys intel IPs (bypass DNS entirely) + inline versions
+    intel_banners = []
+    if opts is not None:
+        iv, intel_banners, inotes = intel_lookup(domain, opts, timeout)
+        notes += inotes
+        for ip, via in iv.items():
+            if ip in seen:
+                continue
+            seen.add(ip)
+            if _is_edge_ip(ip):
+                continue  # intel can return the CDN edge too — skip it
+            ips.append((ip, via))
+
     attempts = []
     best = None
     for ip, via in ips:
@@ -1076,10 +1197,19 @@ def try_origin_bypass(domain, host, extra_hosts, insecure, timeout):
             best = ob
         elif ob.get("reachable") and (ob.get("x_powered_by") or ob.get("php_signals")) and not best:
             best = ob
+
+    # if the live grab found no version but an intel banner carried one, use it
+    if (not best or not best.get("version")) and intel_banners:
+        ip, ver, src = intel_banners[0]
+        best = {"origin_ip": ip, "version": ver, "version_source": src,
+                "server": None, "x_powered_by": None, "reachable": False,
+                "php_signals": [], "via_host": "intel-banner"}
+        notes.append("PHP version %s from %s banner (intel; host may sit behind a CDN)" % (ver, src.split(":")[0]))
+
     if ips and not attempts:
         notes.append("origin candidates found but none answered a direct request")
     elif not ips and not notes:
-        notes.append("no non-edge origin IP discovered via passive DNS")
+        notes.append("no non-edge origin IP discovered (passive DNS; add --shodan/--censys for more)")
     return best, attempts, notes
 
 
@@ -1206,7 +1336,7 @@ def scan_target(target, opts):
         extra = getattr(opts, "_recon_hosts", None)
         best, attempts, onotes = try_origin_bypass(
             host.split(".", 1)[-1] if host and host.count(".") >= 2 else host,
-            host, extra, opts.insecure, opts.timeout)
+            host, extra, opts.insecure, opts.timeout, opts=opts)
         r.origin = {"best": best, "attempts": attempts, "notes": onotes}
         if best and best.get("version"):
             r.php_detected, r.version, r.version_source = True, best["version"], best["version_source"]
@@ -1325,6 +1455,9 @@ def main():
     ap.add_argument("--phpinfo-paths", action="store_true", help="look for exposed phpinfo() (more requests)")
     ap.add_argument("--deep-version", action="store_true", help="extra version techniques: PHP easter eggs + version-leak files (composer.json, .env, ...)")
     ap.add_argument("--origin-scan", action="store_true", help="try to reach the PHP origin behind Cloudflare/WAF (direct-to-IP request with real Host header)")
+    ap.add_argument("--shodan-key", help="Shodan API key for origin intel (or env SHODAN_API_KEY); implies --origin-scan")
+    ap.add_argument("--censys-id", help="Censys API ID (or env CENSYS_API_ID)")
+    ap.add_argument("--censys-secret", help="Censys API secret (or env CENSYS_API_SECRET); id+secret imply --origin-scan")
     ap.add_argument("--probe", action="store_true", help="WARNING: multipart load probe (may cause DoS; authorized use only)")
     ap.add_argument("--probe-count", type=int, default=5, help="number of probe requests (default 5)")
     ap.add_argument("--threads", type=int, default=5)
@@ -1333,6 +1466,14 @@ def main():
     ap.add_argument("-o", "--output", help="save JSON to path")
     ap.add_argument("--csv", help="save CSV to path")
     opts = ap.parse_args()
+
+    # resolve API creds from flags or environment
+    opts.shodan_key = opts.shodan_key or os.environ.get("SHODAN_API_KEY")
+    opts.censys_id = opts.censys_id or os.environ.get("CENSYS_API_ID")
+    opts.censys_secret = opts.censys_secret or os.environ.get("CENSYS_API_SECRET")
+    # providing credentials turns on the origin-bypass flow automatically
+    if opts.shodan_key or (opts.censys_id and opts.censys_secret):
+        opts.origin_scan = True
 
     targets = list(opts.targets)
     if opts.file:
@@ -1389,7 +1530,13 @@ def main():
         opts._recon_hosts = sorted(seen)
 
     if opts.origin_scan:
-        say("[i] ORIGIN-SCAN active: probing non-edge IPs directly with the real Host header to bypass CDN/WAF. Authorized targets only.")
+        prov = []
+        if opts.shodan_key:
+            prov.append("Shodan")
+        if opts.censys_id and opts.censys_secret:
+            prov.append("Censys")
+        intel = (" + intel: %s" % ", ".join(prov)) if prov else ""
+        say("[i] ORIGIN-SCAN active: probing non-edge IPs directly with the real Host header to bypass CDN/WAF%s. Authorized targets only." % intel)
 
     if opts.probe:
         say("[!] PROBE active: sending multipart load. DoS risk on fragile workers. Confirm you are authorized.")

@@ -74,6 +74,8 @@ python3 php2shell_scan.py https://example.com --probe --probe-count 5
 | `--phpinfo-paths` | Probe common exposed `phpinfo()` paths |
 | `--deep-version` | Extra version techniques: PHP easter eggs + version-leak files (`composer.json`, `.env`, …) |
 | `--origin-scan` | Reach the PHP origin behind Cloudflare/WAF — direct-to-IP request with the real Host header |
+| `--shodan-key` | Shodan API key for origin intel (or env `SHODAN_API_KEY`); implies `--origin-scan` |
+| `--censys-id` / `--censys-secret` | Censys API creds (or env `CENSYS_API_ID` / `CENSYS_API_SECRET`); imply `--origin-scan` |
 | `--probe` | Multipart load probe — **DoS risk**, authorized only |
 | `--probe-count N` | Number of probe requests (default 5) |
 | `--threads N` / `--timeout N` | Concurrency / per-request timeout |
@@ -127,6 +129,27 @@ the edge. With `--origin-scan` the scanner, using passive DNS only:
 
 No exploitation, no edge-evasion payloads — just a direct request to an IP the
 DNS surface already exposed. Authorized targets only.
+
+#### Threat-intel origin discovery (Shodan / Censys)
+
+When DNS exposes no origin, **Shodan** and **Censys** can still reveal it — they
+index real origin banners captured before the CDN was placed (or from
+non-proxied ports). Provide credentials and the scanner will:
+
+- pull candidate IPs tied to the domain (by hostname / TLS-cert / DNS name),
+- drop any that fall in a CDN/WAF edge range (IPv4 + IPv6),
+- banner-grab the rest directly, **and** read any PHP version already present
+  in the Shodan/Censys banner (flagged as intel — may be stale, re-verify live).
+
+```bash
+export SHODAN_API_KEY=xxxxxxxx
+export CENSYS_API_ID=xxxx CENSYS_API_SECRET=xxxx
+python3 php2shell_scan.py hackersec.com --origin-scan      # keys auto-detected
+# or inline:
+python3 php2shell_scan.py hackersec.com --shodan-key xxxx --censys-id a --censys-secret b
+```
+
+Supplying any credential turns on `--origin-scan` automatically.
 
 Each verdict carries a **confidence** grade:
 
