@@ -691,7 +691,7 @@ MULTI_LABEL_SUFFIXES = frozenset((
 def registrable_domain(host):
     """
     Reduce a hostname to the registrable (apex) domain, honoring common
-    two-label public suffixes. 'www.webcup.com.br' -> 'webcup.com.br',
+    two-label public suffixes. 'www.example.com.br' -> 'example.com.br',
     'origin.example.com' -> 'example.com'. Returns host unchanged when it is
     already at (or below) the apex. Used only to seed sibling-subdomain origin
     discovery for an OWNED domain — never to reach across to unrelated hosts.
