@@ -255,7 +255,7 @@ def fingerprint_headers(res):
 
 
 def fingerprint_phpinfo(opener, base, paths):
-    """Look for exposed phpinfo(); return (version, path) or (None, None)."""
+    """Look for exposed phpinfo(); return (version, path, body) or (None, None, None)."""
     for p in paths:
         url = urllib.parse.urljoin(base + "/", p.lstrip("/"))
         res = http_get(opener, url)
@@ -265,8 +265,159 @@ def fingerprint_phpinfo(opener, base, paths):
                 for pat in PHPINFO_PATTERNS:
                     m = pat.search(body)
                     if m:
-                        return m.group(1), p
+                        return m.group(1), p, body
+    return None, None, None
+
+
+# ---------------------------------------------------------------------------
+# Passive enrichment — extra signals to judge exposure WITHOUT exploitation
+# ---------------------------------------------------------------------------
+# Persistent-worker SAPIs reuse request state across requests => directly
+# relevant to CVE-2026-109619 (stale global state). Per-request SAPIs (plain
+# CGI) spin a fresh process per request and are far less exposed to it.
+PERSISTENT_SAPIS = ("fpm", "fpm-fcgi", "apache2handler", "mod_php", "litespeed", "phpdbg", "cli-server")
+PERREQUEST_SAPIS = ("cgi", "cgi-fcgi")
+
+PROXY_MARKERS = [
+    ("Cloudflare", ("server:cloudflare", "cf-ray", "cf-cache-status")),
+    ("Akamai", ("server:akamaighost", "x-akamai", "akamai")),
+    ("AWS CloudFront", ("x-amz-cf-id", "via:cloudfront", "server:cloudfront")),
+    ("Fastly", ("x-served-by", "x-fastly", "fastly")),
+    ("Sucuri WAF", ("x-sucuri-id", "server:sucuri")),
+    ("Imperva/Incapsula", ("x-iinfo", "incap_ses", "visid_incap")),
+    ("Varnish", ("x-varnish", "via:varnish")),
+    ("nginx proxy", ("via:nginx",)),
+]
+# Distro build suffixes: version looks upstream-vulnerable but the distro may
+# have backported the fix without bumping the upstream number => reduce
+# confidence, do not report a hard VULNERABLE from version alone.
+DISTRO_RX = re.compile(r"(ubuntu|debian|deb\d|\+deb|\.el\d|~dfsg|\.fc\d|suse|amzn|alpine)", re.I)
+
+
+def _header(hdrs_lower, name):
+    return hdrs_lower.get(name.lower(), "")
+
+
+def detect_sapi(hdrs_lower, phpinfo=None):
+    """
+    Infer the PHP SAPI / worker model from headers and phpinfo.
+    Returns (sapi_label, persistent: bool|None). Passive only.
+    """
+    if phpinfo and phpinfo.get("sapi"):
+        s = phpinfo["sapi"].lower()
+        if any(k in s for k in PERSISTENT_SAPIS):
+            return phpinfo["sapi"], True
+        if any(k in s for k in PERREQUEST_SAPIS):
+            return phpinfo["sapi"], False
+        return phpinfo["sapi"], None
+    xpb = _header(hdrs_lower, "x-powered-by").lower()
+    server = _header(hdrs_lower, "server").lower()
+    if "php-fpm" in xpb or "fpm" in xpb:
+        return "fpm", True
+    if "mod_php" in server or ("apache" in server and "php/" in server):
+        return "apache2handler (mod_php)", True
+    if "litespeed" in server:
+        return "litespeed", True
+    if "php-cgi" in xpb or "cgi" in xpb:
+        return "cgi", False
+    # nginx + PHP almost always means php-fpm in practice
+    if "nginx" in server:
+        return "fpm (inferred: nginx)", True
     return None, None
+
+
+def detect_proxy(hdrs_lower):
+    """Identify a CDN/WAF/proxy in front; its banner may not be the origin's."""
+    blob = " ".join("%s:%s" % (k, v) for k, v in hdrs_lower.items()).lower()
+    hits = []
+    for name, markers in PROXY_MARKERS:
+        for mk in markers:
+            if mk in blob:
+                hits.append(name)
+                break
+    return ", ".join(dict.fromkeys(hits)) or None
+
+
+def parse_phpinfo_deep(body):
+    """
+    Extract non-exploit config fields from an exposed phpinfo() page. These
+    refine exposure: memory_limit/post_max_size/max_input_vars size the OOM
+    attack surface (CVE-2026-109618); Server API gives the real SAPI;
+    disable_functions is a mitigation signal.
+    """
+    out = {}
+    def grab(label, rx):
+        m = re.search(rx, body, re.I)
+        if m:
+            out[label] = m.group(1).strip()
+    grab("sapi", r"Server API\s*</td>\s*<td[^>]*>\s*([^<]+)")
+    grab("build_date", r"Build Date\s*</td>\s*<td[^>]*>\s*([^<]+)")
+    grab("zend", r"Zend Engine\s*v?([\d.]+)")
+    grab("memory_limit", r"memory_limit\s*</td>\s*<td[^>]*>\s*([^<]+)")
+    grab("post_max_size", r"post_max_size\s*</td>\s*<td[^>]*>\s*([^<]+)")
+    grab("max_input_vars", r"max_input_vars\s*</td>\s*<td[^>]*>\s*([^<]+)")
+    grab("disable_functions", r"disable_functions\s*</td>\s*<td[^>]*>\s*([^<]+)")
+    # plain-text phpinfo (CLI) fallbacks
+    if "sapi" not in out:
+        grab("sapi", r"Server API\s*=>\s*(.+)")
+    if "build_date" not in out:
+        grab("build_date", r"Build Date\s*=>\s*(.+)")
+    return out
+
+
+def assess_confidence(r):
+    """
+    Grade how trustworthy the version-based verdict is, and attach caveats.
+    Pure reasoning over already-collected passive signals — no new requests.
+    """
+    notes = []
+    conf = "LOW"
+    src = r.version_source or ""
+
+    if r.version:
+        if src.startswith("phpinfo"):
+            conf = "HIGH"
+            notes.append("version from exposed phpinfo() (authoritative)")
+        elif "errorpage" in src:
+            conf = "HIGH"
+            notes.append("version from PHP error page (authoritative)")
+        elif src.startswith(("header:", "banner:")):
+            conf = "MEDIUM"
+            notes.append("version from HTTP banner (expose_php=On)")
+    else:
+        notes.append("no version disclosed — verdict is inference-only")
+
+    # distro backport caveat (big false-positive source)
+    if r.distro_build:
+        notes.append("distro-packaged build (%s): fix may be BACKPORTED without a version bump — verify the package changelog, not just the number" % r.distro_build)
+        if conf == "HIGH":
+            conf = "MEDIUM"
+        elif conf == "MEDIUM":
+            conf = "LOW"
+
+    # proxy/CDN caveat (banner may be the edge, not the origin)
+    if r.proxy:
+        notes.append("%s in front: banner may reflect the proxy, not the PHP origin" % r.proxy)
+        if r.version and src.startswith(("header:", "banner:")) and conf != "LOW":
+            conf = "LOW"
+
+    # SAPI relevance to CVE-2026-109619
+    if r.worker_persistent is True:
+        notes.append("persistent worker (%s): exposed to CVE-2026-109619 stale-state reuse" % (r.sapi or "?"))
+    elif r.worker_persistent is False:
+        notes.append("per-request SAPI (%s): reduced exposure to CVE-2026-109619" % (r.sapi or "cgi"))
+
+    # OOM surface from phpinfo (CVE-2026-109618)
+    pi = r.phpinfo or {}
+    if pi.get("post_max_size") or pi.get("max_input_vars"):
+        notes.append("OOM surface: post_max_size=%s max_input_vars=%s memory_limit=%s" % (
+            pi.get("post_max_size", "?"), pi.get("max_input_vars", "?"), pi.get("memory_limit", "?")))
+    if pi.get("disable_functions") and pi["disable_functions"] not in ("no value", "", "none"):
+        notes.append("disable_functions set (post-exploit mitigation present)")
+
+    r.confidence = conf
+    r.notes = notes
+    return r
 
 
 def detect_php_presence(opener, base):
@@ -685,6 +836,15 @@ class TargetResult:
     presence_signals: list = field(default_factory=list)
     banner: dict = None
     probe: dict = None
+    # passive enrichment (no exploitation) — refines the version verdict
+    server: str = None            # full Server header
+    sapi: str = None              # worker model: fpm / mod_php / cgi / unknown
+    worker_persistent: bool = None  # persistent worker? (relevant to CVE-2026-109619)
+    proxy: str = None             # CDN/WAF/proxy in front (banner may be masked)
+    distro_build: str = None      # distro package marker (backport may have fixed)
+    phpinfo: dict = field(default_factory=dict)  # deep-parsed phpinfo fields
+    confidence: str = None        # HIGH / MEDIUM / LOW for the verdict
+    notes: list = field(default_factory=list)    # human-readable caveats
     error: str = None
 
 
@@ -714,6 +874,16 @@ def scan_target(target, opts):
         r.php_detected, r.version, r.version_source = True, ver, src
     r.presence_signals += [s for s in detect_php_signals(root)]
 
+    # passive enrichment from root headers (no exploitation)
+    hdrs_lower = {k.lower(): v for k, v in root.get("headers", {}).items()}
+    r.server = hdrs_lower.get("server")
+    r.proxy = detect_proxy(hdrs_lower)
+    r.sapi, r.worker_persistent = detect_sapi(hdrs_lower)
+    ver_blob = " ".join(filter(None, [r.server, hdrs_lower.get("x-powered-by"), r.version or ""]))
+    dm = DISTRO_RX.search(ver_blob)
+    if dm:
+        r.distro_build = dm.group(1).lower()
+
     # 2) presence fingerprint if no version
     if not r.php_detected:
         sigs, _ = detect_php_presence(opener, base)
@@ -733,11 +903,21 @@ def scan_target(target, opts):
         if b.get("version") and not r.version:
             r.php_detected, r.version, r.version_source = True, b["version"], b["version_source"]
 
-    # 4) exposed phpinfo
-    if opts.phpinfo_paths and (not r.version):
-        ver, p = fingerprint_phpinfo(opener, base, DEFAULT_PHPINFO_PATHS)
-        if ver:
-            r.php_detected, r.version, r.version_source = True, ver, "phpinfo:%s" % p
+    # 4) exposed phpinfo (deep-parse for extra passive signals)
+    if opts.phpinfo_paths:
+        ver, p, body = fingerprint_phpinfo(opener, base, DEFAULT_PHPINFO_PATHS)
+        if body:
+            r.phpinfo = parse_phpinfo_deep(body)
+            if ver and not (r.version and r.version_source.startswith("phpinfo")):
+                r.php_detected, r.version, r.version_source = True, ver, "phpinfo:%s" % p
+            # phpinfo SAPI overrides header-inferred SAPI (authoritative)
+            if r.phpinfo.get("sapi"):
+                r.sapi, r.worker_persistent = detect_sapi({}, r.phpinfo)
+            # distro marker from phpinfo build string too
+            if not r.distro_build:
+                dm = DISTRO_RX.search(" ".join(r.phpinfo.values()))
+                if dm:
+                    r.distro_build = dm.group(1).lower()
 
     # 5) classification
     if r.php_detected:
@@ -749,7 +929,10 @@ def scan_target(target, opts):
         r.status = "NO_PHP_DETECTED"
         r.detail = "no PHP signal on the HTTP surface"
 
-    # 6) opt-in probe
+    # 6) grade confidence + attach caveats (pure reasoning, no new requests)
+    assess_confidence(r)
+
+    # 7) opt-in probe
     if opts.probe and r.php_detected:
         r.probe = run_probe(opener, base, count=opts.probe_count)
 
@@ -781,17 +964,37 @@ def fmt_result(r):
         lines.append("  Version       : %s  (source: %s)" % (r.version, r.version_source))
     if r.presence_signals:
         lines.append("  Signals       : %s" % ", ".join(r.presence_signals))
-    lines.append("  STATUS        : %s" % (r.status or "-"))
+    conf = (" [confidence: %s]" % r.confidence) if r.confidence else ""
+    lines.append("  STATUS        : %s%s" % (r.status or "-", conf))
     if r.detail:
         lines.append("  Detail        : %s" % r.detail)
+    # passive-signal block
+    if r.server:
+        lines.append("  Server        : %s" % r.server)
+    if r.sapi:
+        wp = {True: "persistent worker", False: "per-request", None: "worker model unknown"}[r.worker_persistent]
+        lines.append("  SAPI          : %s (%s)" % (r.sapi, wp))
+    if r.proxy:
+        lines.append("  Proxy/WAF     : %s" % r.proxy)
+    if r.distro_build:
+        lines.append("  Build         : distro-packaged (%s) — backport possible" % r.distro_build)
+    if r.phpinfo:
+        pi = r.phpinfo
+        kv = [("%s=%s" % (k, pi[k])) for k in ("build_date", "memory_limit", "post_max_size", "max_input_vars") if pi.get(k)]
+        if kv:
+            lines.append("  phpinfo       : %s" % ", ".join(kv))
     for cve, desc in CVES.items():
         v = (r.cves or {}).get(cve, "-")
         ghsa = ADVISORIES.get(cve, "")
         lines.append("    %s (%s) [%s] -> %s" % (cve, ghsa, desc.split("(")[0].strip(), v))
+    if r.notes:
+        lines.append("  Notes:")
+        for n in r.notes:
+            lines.append("    - %s" % n)
     if r.banner and r.banner.get("probes"):
         srv = next((p.get("server") for p in r.banner["probes"] if p.get("server")), None)
         xpb = next((p.get("x_powered_by") for p in r.banner["probes"] if p.get("x_powered_by")), None)
-        if srv or xpb:
+        if (srv or xpb) and not r.server:
             lines.append("  BANNER        : Server=%s X-Powered-By=%s" % (srv, xpb))
     if r.probe:
         lines.append("  PROBE         : %s" % r.probe["verdict"])
@@ -887,18 +1090,62 @@ def main():
             results.append(r)
             say(fmt_result(r))
 
-    # summary
-    say("─" * 62)
+    # ----------------------------- SUMMARY -----------------------------
+    say("")
+    say("╔" + "═" * 60 + "╗")
+    say("║ php2shell-scanner — CONSOLIDATED RESULTS".ljust(61) + "║")
+    say("╚" + "═" * 60 + "╝")
+    say("Advisories: CVE-2026-109618 (GHSA-w8hw-w9fx-j79w) · "
+        "CVE-2026-109619 (GHSA-6wmf-4rv5-p3rp)")
+
     counts = {}
     for r in results:
         counts[r.status or "ERROR"] = counts.get(r.status or "ERROR", 0) + 1
-    say("SUMMARY: %d target(s) — %s" % (len(results), ", ".join("%s=%d" % kv for kv in sorted(counts.items()))))
-    vulns = [r for r in results if r.status in ("VULNERABLE", "VULNERABLE_EOL")]
-    if vulns:
-        say("VULNERABLE TARGETS (CVE-2026-109618/109619):")
-        for r in vulns:
-            say("  %s  (%s)" % (r.target, r.version or "no version"))
+    order = ["VULNERABLE", "VULNERABLE_EOL", "UNKNOWN", "PATCHED", "NO_PHP_DETECTED", "ERROR"]
+    tally = " ".join("%s=%d" % (k, counts[k]) for k in order if k in counts)
+    extra = " ".join("%s=%d" % (k, v) for k, v in counts.items() if k not in order)
+    say(("Scanned %d target(s): %s %s" % (len(results), tally, extra)).rstrip())
 
+    def _row(r):
+        bits = [r.version or "no-version"]
+        if r.confidence:
+            bits.append("conf=%s" % r.confidence)
+        if r.worker_persistent is True:
+            bits.append("persistent-worker")
+        if r.proxy:
+            bits.append("behind:%s" % r.proxy)
+        if r.distro_build:
+            bits.append("distro:%s" % r.distro_build)
+        return "  %-45s  %s" % (r.target, "  ".join(bits))
+
+    vuln = [r for r in results if r.status == "VULNERABLE"]
+    eol = [r for r in results if r.status == "VULNERABLE_EOL"]
+    unknown = [r for r in results if r.status == "UNKNOWN"]
+
+    if vuln:
+        say("")
+        say("[!] VULNERABLE — PHP < fixed version (patch available):")
+        for r in sorted(vuln, key=lambda x: {"HIGH": 0, "MEDIUM": 1, "LOW": 2}.get(x.confidence, 3)):
+            say(_row(r))
+    if eol:
+        say("")
+        say("[!] VULNERABLE (EOL) — no upstream patch; check distro backport:")
+        for r in eol:
+            say(_row(r))
+    if unknown:
+        say("")
+        say("[?] UNKNOWN — PHP present, version undisclosed (manual check):")
+        for r in unknown:
+            say(_row(r))
+
+    # actionable pointers
+    review = [r for r in (vuln + eol) if r.confidence in ("LOW", "MEDIUM")]
+    if review:
+        say("")
+        say("[i] %d result(s) are LOW/MEDIUM confidence — verify before reporting "
+            "(proxy banner or distro backport may change the verdict)." % len(review))
+
+    vulns = vuln + eol
     if opts.output:
         with open(opts.output, "w") as fh:
             json.dump([asdict(r) for r in results], fh, indent=2, default=str)
@@ -907,9 +1154,12 @@ def main():
         import csv as _csv
         with open(opts.csv, "w", newline="") as fh:
             w = _csv.writer(fh)
-            w.writerow(["target", "php_detected", "version", "source", "status", "cve-2026-109618", "cve-2026-109619", "detail", "error"])
+            w.writerow(["target", "php_detected", "version", "source", "status", "confidence",
+                        "sapi", "persistent_worker", "proxy", "distro_build",
+                        "cve-2026-109618", "cve-2026-109619", "detail", "error"])
             for r in results:
-                w.writerow([r.target, r.php_detected, r.version, r.version_source, r.status,
+                w.writerow([r.target, r.php_detected, r.version, r.version_source, r.status, r.confidence,
+                            r.sapi, r.worker_persistent, r.proxy, r.distro_build,
                             (r.cves or {}).get("CVE-2026-109618", ""), (r.cves or {}).get("CVE-2026-109619", ""),
                             r.detail, r.error])
         say("CSV saved to %s" % opts.csv)

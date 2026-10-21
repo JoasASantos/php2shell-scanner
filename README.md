@@ -78,6 +78,38 @@ python3 php2shell_scan.py https://example.com --probe --probe-count 5
 | `--insecure` | Do not validate TLS |
 | `-o FILE` / `--csv FILE` | Save JSON / CSV report |
 
+## Passive enrichment (no exploitation)
+
+Beyond the version check, each target is enriched with passive signals that
+refine the verdict and cut false positives — all from normal responses, no
+exploit attempt:
+
+- **SAPI / worker model** — `fpm`, `mod_php`, `cgi`. Persistent workers reuse
+  request state, so they are the ones exposed to **CVE-2026-109619** (stale
+  global state); plain CGI is far less exposed.
+- **CDN / WAF / proxy** (Cloudflare, Akamai, CloudFront, Fastly, Sucuri, …) —
+  a banner may reflect the edge, not the PHP origin, so the version reading is
+  flagged lower-confidence.
+- **Distro-packaged build** (`ubuntu`, `+deb`, `.el8`, …) — distros backport
+  fixes **without** bumping the upstream number, so a version-only match may be
+  a false positive; verdict confidence is reduced with a "verify the changelog"
+  note.
+- **Deep phpinfo parse** (when exposed) — Server API, build date,
+  `memory_limit` / `post_max_size` / `max_input_vars` (OOM surface for
+  **CVE-2026-109618**), and `disable_functions` (mitigation).
+
+Each verdict carries a **confidence** grade:
+
+| Confidence | Meaning |
+|-----------|---------|
+| `HIGH`   | version from exposed phpinfo() or a PHP error page |
+| `MEDIUM` | version from an HTTP banner (`expose_php=On`) |
+| `LOW`    | inference only, or behind a proxy, or a distro backport may apply |
+
+The consolidated output groups targets by severity, sorts VULNERABLE by
+confidence (HIGH first), and flags LOW/MEDIUM results to re-check before
+reporting.
+
 ## Detection logic
 
 Version comparison per branch against the `FIXED` table:
